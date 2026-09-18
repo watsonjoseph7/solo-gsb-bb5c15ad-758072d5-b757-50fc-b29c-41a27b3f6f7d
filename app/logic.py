@@ -7,6 +7,7 @@
 修订 = 追加新版本并把被覆盖的旧版本标记 superseded_at，历史行永不修改、永不删除。
 """
 
+import math
 import sqlite3
 from datetime import datetime
 from typing import Optional
@@ -17,6 +18,9 @@ from .timeutil import iso, now_iso
 # 无限期区间的上界占位（仅用于 SQL 比较）
 INF = "9999-12-31T23:59:59.999999+00:00"
 
+# 费用/比例的小数精度
+MONEY_DIGITS = 6
+
 
 class InvalidIntervalError(ValueError):
     """区间终点不晚于起点（valid_to <= valid_from，或查询窗口 from >= to）。"""
@@ -24,6 +28,10 @@ class InvalidIntervalError(ValueError):
 
 class NonMonotonicRecordTimeError(ValueError):
     """recorded_at 早于该合同已有记录，破坏系统时间单调性。"""
+
+
+class InvalidAmountError(ValueError):
+    """账单行金额非法（负数或 NaN/Inf 等非有限值）。"""
 
 
 def record_rate(
@@ -130,45 +138,22 @@ def get_timeline(contract_no: str) -> list[sqlite3.Row]:
     return list(rows)
 
 
-def compute_coverage(
-    contract_no: str,
-    from_dt: datetime,
-    to_dt: datetime,
-    known_at: Optional[datetime],
-) -> tuple[list[dict], str]:
-    """计算查询窗口 [from, to) 在 known_at 认知时点下的覆盖率分段。
+def _segment_window(rows: list[sqlite3.Row], f: str, t: str) -> list[dict]:
+    """把窗口 [f, t) 按 rows 中版本的业务边界切成连续片段并分类。
 
-    先筛出 known_at 可见的版本（recorded_at <= known_at 且未被取代），
+    rows 为同一认知时点下可见的版本行，与窗口不相交的行在此过滤；
     将其业务区间裁剪到窗口后，以所有区间边界把窗口切成连续片段；
     每段按命中的候选版本数分类：0 → gap，1 → covered，>1 → conflict；
     分类与候选完全相同的相邻段合并为一段。
 
-    返回 (segments, 实际使用的 known_at)。segment 为
-    {"from", "to", "status", "candidates": [Row]} 字典，连续铺满整个窗口；
-    无可见版本时自然得到覆盖整窗的单个 gap 段。
+    返回 {"from", "to", "status", "candidates": [Row]} 字典列表，连续铺满
+    整个窗口；rows 为空时自然得到覆盖整窗的单个 gap 段。
     """
-    f = iso(from_dt)
-    t = iso(to_dt)
-    if f >= t:
-        raise InvalidIntervalError("from 必须早于 to")
-    ka = iso(known_at) if known_at is not None else now_iso()
-
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM rate_versions "
-            "WHERE contract_no = ? "
-            "  AND recorded_at <= ? "
-            "  AND (superseded_at IS NULL OR superseded_at > ?) "
-            "  AND valid_from < ? "
-            "  AND (valid_to IS NULL OR valid_to > ?) "
-            "ORDER BY version ASC, id ASC",
-            (contract_no, ka, ka, t, f),
-        ).fetchall()
-
     # 可见版本的业务区间裁剪到查询窗口（NULL valid_to 用 INF 占位参与比较）
     clipped = [
         (max(row["valid_from"], f), min(row["valid_to"] or INF, t), row)
         for row in rows
+        if row["valid_from"] < t and (row["valid_to"] or INF) > f
     ]
 
     # 以所有区间边界（含窗口端点）切分 [f, t)
@@ -193,4 +178,130 @@ def compute_coverage(
                 {"from": seg_from, "to": seg_to, "status": seg_status, "candidates": candidates}
             )
             last_key = key
-    return segments, ka
+    return segments
+
+
+def compute_coverage(
+    contract_no: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    known_at: Optional[datetime],
+) -> tuple[list[dict], str]:
+    """计算查询窗口 [from, to) 在 known_at 认知时点下的覆盖率分段。
+
+    先筛出 known_at 可见的版本（recorded_at <= known_at 且未被取代），
+    再以 _segment_window 把窗口切分为连续片段并逐段分类。
+
+    返回 (segments, 实际使用的 known_at)。
+    """
+    f = iso(from_dt)
+    t = iso(to_dt)
+    if f >= t:
+        raise InvalidIntervalError("from 必须早于 to")
+    ka = iso(known_at) if known_at is not None else now_iso()
+
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM rate_versions "
+            "WHERE contract_no = ? "
+            "  AND recorded_at <= ? "
+            "  AND (superseded_at IS NULL OR superseded_at > ?) "
+            "  AND valid_from < ? "
+            "  AND (valid_to IS NULL OR valid_to > ?) "
+            "ORDER BY version ASC, id ASC",
+            (contract_no, ka, ka, t, f),
+        ).fetchall()
+    return _segment_window(rows, f, t), ka
+
+
+def compute_charge_preview(
+    contract_no: str,
+    lines: list[tuple[datetime, datetime, float]],
+    known_at: Optional[datetime],
+) -> tuple[list[dict], Optional[float], str]:
+    """费用试算：把每条账单行 [from, to) 按 known_at 可见版本的业务边界拆分，
+    每片段费用 = base_amount × 命中费率 × (片段时长 / 行时长)，再汇总行费用与总额。
+
+    lines 为 (from, to, base_amount) 三元组列表，不能为空；
+    base_amount 必须是不小于 0 的有限数值，否则抛 InvalidAmountError；
+    任一行 from >= to 抛 InvalidIntervalError。
+
+    片段为 gap（无费率）或 conflict（重叠冲突）时不计费；账单行含此类片段时
+    该行 amount 为 None；任一行未完全覆盖时总额为 None（拒绝总额）。
+    金额与时长比例均保留 MONEY_DIGITS 位小数（金额按未取整的比例计算后再取整）。
+
+    返回 (lines_result, total_or_None, 实际使用的 known_at)。
+    """
+    ka = iso(known_at) if known_at is not None else now_iso()
+
+    norm = []  # (f, t, base_amount)，时间已规范化为等宽 ISO 字符串
+    for idx, (from_dt, to_dt, base_amount) in enumerate(lines):
+        f, t = iso(from_dt), iso(to_dt)
+        if f >= t:
+            raise InvalidIntervalError(f"第 {idx + 1} 行账单区间非法：from 必须早于 to")
+        if not math.isfinite(base_amount) or base_amount < 0:
+            raise InvalidAmountError(
+                f"第 {idx + 1} 行 base_amount 必须是不小于 0 的有限数值"
+            )
+        norm.append((f, t, float(base_amount)))
+
+    lo = min(f for f, _, _ in norm)
+    hi = max(t for _, t, _ in norm)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM rate_versions "
+            "WHERE contract_no = ? "
+            "  AND recorded_at <= ? "
+            "  AND (superseded_at IS NULL OR superseded_at > ?) "
+            "  AND valid_from < ? "
+            "  AND (valid_to IS NULL OR valid_to > ?) "
+            "ORDER BY version ASC, id ASC",
+            (contract_no, ka, ka, hi, lo),
+        ).fetchall()
+
+    out_lines = []
+    grand_total = 0.0
+    all_covered = True
+    for f, t, base_amount in norm:
+        span = (datetime.fromisoformat(t) - datetime.fromisoformat(f)).total_seconds()
+        segments = []
+        line_total = 0.0
+        line_status = "ok"
+        for seg in _segment_window(rows, f, t):
+            seg_span = (
+                datetime.fromisoformat(seg["to"]) - datetime.fromisoformat(seg["from"])
+            ).total_seconds()
+            ratio = seg_span / span
+            if seg["status"] == "covered":
+                hit = seg["candidates"][0]
+                amount = round(base_amount * hit["rate"] * ratio, MONEY_DIGITS)
+                line_total += amount
+                segments.append({
+                    "from": seg["from"], "to": seg["to"], "status": "covered",
+                    "rate_id": hit["id"], "rate": hit["rate"],
+                    "ratio": round(ratio, MONEY_DIGITS), "amount": amount,
+                    "candidates": [],
+                })
+            else:
+                if seg["status"] == "conflict":
+                    line_status = "conflict"
+                elif line_status == "ok":
+                    line_status = "gap"
+                segments.append({
+                    "from": seg["from"], "to": seg["to"], "status": seg["status"],
+                    "rate_id": None, "rate": None,
+                    "ratio": round(ratio, MONEY_DIGITS), "amount": None,
+                    "candidates": seg["candidates"] if seg["status"] == "conflict" else [],
+                })
+        if line_status == "ok":
+            line_amount = round(line_total, MONEY_DIGITS)
+            grand_total += line_amount
+        else:
+            line_amount = None
+            all_covered = False
+        out_lines.append({
+            "from": f, "to": t, "base_amount": base_amount,
+            "status": line_status, "amount": line_amount, "segments": segments,
+        })
+    total = round(grand_total, MONEY_DIGITS) if all_covered else None
+    return out_lines, total, ka

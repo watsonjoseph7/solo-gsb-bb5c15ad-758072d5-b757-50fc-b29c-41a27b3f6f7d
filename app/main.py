@@ -92,6 +92,52 @@ class CoverageResponse(BaseModel):
     segments: list[CoverageSegment]
 
 
+class ChargeLineIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: datetime = Field(alias="from", description="账单行起点（含），ISO-8601")
+    to: datetime = Field(description="账单行终点（不含），ISO-8601")
+    base_amount: float = Field(description="计费基数金额，必须 >= 0")
+
+
+class ChargePreviewRequest(BaseModel):
+    known_at: Optional[datetime] = Field(default=None, description="认知时点，缺省为当前时间")
+    lines: list[ChargeLineIn] = Field(min_length=1, description="账单行列表，至少一行")
+
+
+class ChargeSegmentView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", description="片段起点（含）")
+    to: str = Field(description="片段终点（不含）")
+    status: str = Field(description="covered / gap / conflict")
+    rate_id: Optional[int] = Field(default=None, description="covered 时命中的费率版本 id")
+    rate: Optional[float] = Field(default=None, description="covered 时命中的费率值")
+    ratio: float = Field(description="片段时长占账单行时长的比例")
+    amount: Optional[float] = Field(default=None, description="该片段分摊费用；gap/conflict 为 null")
+    candidates: list[VersionView] = Field(default_factory=list, description="conflict 时的全部候选版本")
+
+
+class ChargeLineView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", description="账单行起点（含）")
+    to: str = Field(description="账单行终点（不含）")
+    base_amount: float
+    status: str = Field(description="ok / gap / conflict（任一片段 conflict 则行为 conflict，其次 gap）")
+    amount: Optional[float] = Field(default=None, description="行费用合计；含 gap/conflict 片段时为 null")
+    segments: list[ChargeSegmentView]
+
+
+class ChargePreviewResponse(BaseModel):
+    contract_no: str
+    known_at: str = Field(description="实际使用的认知时点")
+    lines: list[ChargeLineView]
+    total_amount: Optional[float] = Field(
+        default=None, description="全部账单行完全覆盖时给出总额；任一行存在 gap/conflict 时为 null（拒绝总额）"
+    )
+
+
 def to_view(row: sqlite3.Row) -> VersionView:
     return VersionView(
         rate_id=row["id"],
@@ -227,5 +273,57 @@ def coverage(
                 candidates=[to_view(r) for r in seg["candidates"]] if seg["status"] == "conflict" else [],
             )
             for seg in segments
+        ],
+    )
+
+
+@app.post("/contracts/{contract_no}/charge-preview", response_model=ChargePreviewResponse)
+def charge_preview(contract_no: str, payload: ChargePreviewRequest):
+    """费用试算：按 known_at 时点可见的双时态费率，把每条账单行 [from, to) 按业务边界
+    拆分为连续片段，covered 片段费用 = base_amount × 命中费率 × 时长占比，
+    汇总行费用与总额。片段为 gap / conflict 时不计费，对应行 amount 为 null；
+    任一行未完全覆盖时 total_amount 为 null（拒绝总额），明细照常返回。"""
+    try:
+        lines, total, ka = logic.compute_charge_preview(
+            contract_no,
+            [(ln.from_, ln.to, ln.base_amount) for ln in payload.lines],
+            payload.known_at,
+        )
+    except logic.InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_INTERVAL", "message": str(exc)},
+        )
+    except logic.InvalidAmountError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_AMOUNT", "message": str(exc)},
+        )
+    return ChargePreviewResponse(
+        contract_no=contract_no,
+        known_at=ka,
+        total_amount=total,
+        lines=[
+            ChargeLineView(
+                from_=ln["from"],
+                to=ln["to"],
+                base_amount=ln["base_amount"],
+                status=ln["status"],
+                amount=ln["amount"],
+                segments=[
+                    ChargeSegmentView(
+                        from_=seg["from"],
+                        to=seg["to"],
+                        status=seg["status"],
+                        rate_id=seg["rate_id"],
+                        rate=seg["rate"],
+                        ratio=seg["ratio"],
+                        amount=seg["amount"],
+                        candidates=[to_view(r) for r in seg["candidates"]],
+                    )
+                    for seg in ln["segments"]
+                ],
+            )
+            for ln in lines
         ],
     )
