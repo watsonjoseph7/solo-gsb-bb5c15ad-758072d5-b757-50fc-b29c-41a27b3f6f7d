@@ -21,3 +21,8 @@ def iso(dt: datetime) -> str:
 
 def now_iso() -> str:
     return iso(datetime.now(timezone.utc))
+
+
+def parse(s: str) -> datetime:
+    """解析 iso() 产出的等宽 UTC ISO 字符串。"""
+    return datetime.fromisoformat(s)

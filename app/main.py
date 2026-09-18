@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.0.0",
+    version="1.1.0",
     description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史。",
     lifespan=lifespan,
 )
@@ -90,6 +90,57 @@ class CoverageResponse(BaseModel):
     to: str = Field(description="查询窗口终点（不含）")
     known_at: str = Field(description="实际使用的认知时点")
     segments: list[CoverageSegment]
+
+
+class ChargeLineIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: datetime = Field(alias="from", description="账单行起点（含），ISO-8601")
+    to: datetime = Field(description="账单行终点（不含），ISO-8601")
+    base_amount: float = Field(description="账单行基准金额（须为非负有限数值），按区间时长比例折算")
+
+
+class ChargePreviewRequest(BaseModel):
+    known_at: Optional[datetime] = Field(default=None, description="认知时点，缺省为当前时间；不得晚于当前时间")
+    lines: list[ChargeLineIn] = Field(min_length=1, description="账单行列表，至少一条")
+
+
+class ChargeCandidate(BaseModel):
+    rate_id: int
+    rate: float
+    version: int
+
+
+class ChargeSegmentView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", description="片段起点（含）")
+    to: str = Field(description="片段终点（不含）")
+    status: str = Field(description="covered / gap / conflict")
+    portion: float = Field(description="该段时长占账单行总时长的比例（6 位小数）")
+    rate_id: Optional[int] = Field(default=None, description="covered 时命中的费率版本 id")
+    rate: Optional[float] = Field(default=None, description="covered 时命中的费率值")
+    charge: Optional[float] = Field(default=None, description="covered 时该段折算费用（6 位小数）")
+    candidates: list[ChargeCandidate] = Field(default_factory=list, description="conflict 时的全部候选版本")
+
+
+class ChargeLineView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", description="账单行起点（含）")
+    to: str = Field(description="账单行终点（不含）")
+    base_amount: float
+    status: str = Field(description="ok / gap / conflict / mixed（同时含 gap 与 conflict 段）")
+    line_total: Optional[float] = Field(default=None, description="行内费用合计；含 gap/conflict 段时为 null")
+    segments: list[ChargeSegmentView]
+
+
+class ChargePreviewResponse(BaseModel):
+    contract_no: str
+    known_at: str = Field(description="实际使用的认知时点")
+    status: str = Field(description="ok / rejected（任一行含 gap/conflict 段，总额被拒绝）")
+    total_amount: Optional[float] = Field(default=None, description="全部行费用合计；rejected 时为 null")
+    lines: list[ChargeLineView]
 
 
 def to_view(row: sqlite3.Row) -> VersionView:
@@ -228,4 +279,38 @@ def coverage(
             )
             for seg in segments
         ],
+    )
+
+
+@app.post("/contracts/{contract_no}/charge-preview", response_model=ChargePreviewResponse)
+def charge_preview(contract_no: str, payload: ChargePreviewRequest):
+    """计费预览：把每条账单行按 known_at 可见费率的业务边界拆分，
+    按时长比例折算各版本费用并汇总；遇 gap/conflict 段时标记并拒绝总额。"""
+    try:
+        result = logic.compute_charge_preview(
+            contract_no,
+            [(line.from_, line.to, line.base_amount) for line in payload.lines],
+            payload.known_at,
+        )
+    except logic.InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_INTERVAL", "message": str(exc)},
+        )
+    except logic.InvalidAmountError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_AMOUNT", "message": str(exc)},
+        )
+    except logic.FutureKnownAtError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_KNOWN_AT", "message": str(exc)},
+        )
+    return ChargePreviewResponse(
+        contract_no=contract_no,
+        known_at=result["known_at"],
+        status="ok" if result["ok"] else "rejected",
+        total_amount=result["total_amount"],
+        lines=result["lines"],
     )

@@ -121,6 +121,80 @@ curl "http://localhost:8000/contracts/HT-2026-001/coverage?from=2026-01-01T00:00
 }
 ```
 
+### 5. 计费预览 — `POST /contracts/{contract_no}/charge-preview`
+
+```bash
+curl -X POST http://localhost:8000/contracts/HT-2026-001/charge-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "known_at": "2026-06-01T00:00:00Z",
+        "lines": [
+          {"from": "2026-01-01T00:00:00Z", "to": "2026-07-01T00:00:00Z", "base_amount": 10000.0},
+          {"from": "2026-07-01T00:00:00Z", "to": "2027-01-01T00:00:00Z", "base_amount": 12000.0}
+        ]
+      }'
+```
+
+每条账单行 `[from, to)` 按 `known_at` 时点可见版本的业务边界拆分
+（与覆盖率分析同一切分规则），`covered` 段费用 =
+`base_amount × (段时长 / 行时长) × 命中费率`；行内汇总为 `line_total`，
+全部行再汇总为 `total_amount`。费用与时长占比 `portion` 均保留 6 位小数（预览口径）。
+`known_at` 缺省为当前时间。
+
+片段（`segments[]`）状态：
+
+| `status` | 含义 | 附带字段 |
+|---|---|---|
+| `covered` | 恰好一个可见版本覆盖该段 | `rate_id`、`rate`、`charge` |
+| `gap` | 无任何可见版本覆盖 | — |
+| `conflict` | 多个可见版本重叠覆盖（脏数据） | `candidates`：全部候选版本（`rate_id` / `rate` / `version`） |
+
+账单行（`lines[]`）状态：`ok`（全部片段 covered）/ `gap` / `conflict` /
+`mixed`（同时含 gap 与 conflict 段）。含 gap/conflict 段的行 `line_total` 为 `null`；
+此时顶层 `status` 为 `rejected`、`total_amount` 为 `null`（**拒绝总额**），
+但未受影响的行仍返回各自的计价结果。合同不存在或该认知时点无可见版本时，
+所有行自然得到整行 `gap`，不报 404。
+
+校验规则：
+
+| 情形 | 状态码 | `code` |
+|---|---|---|
+| 账单行 `from >= to` | 422 | `INVALID_INTERVAL` |
+| `base_amount` 为负或非有限数值 | 422 | `INVALID_AMOUNT` |
+| `known_at` 晚于当前时间 | 422 | `INVALID_KNOWN_AT` |
+| 缺少必填字段 / `lines` 为空 / 时间格式非法 | 422 | `INVALID_REQUEST` |
+
+响应示例（两个版本各覆盖一行，全部可计价）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "known_at": "2026-06-01T00:00:00.000000+00:00",
+  "status": "ok",
+  "total_amount": 1216.0,
+  "lines": [
+    {
+      "from": "2026-01-01T00:00:00.000000+00:00", "to": "2026-07-01T00:00:00.000000+00:00",
+      "base_amount": 10000.0, "status": "ok", "line_total": 520.0,
+      "segments": [
+        {"from": "2026-01-01T00:00:00.000000+00:00", "to": "2026-07-01T00:00:00.000000+00:00",
+         "status": "covered", "portion": 1.0, "rate_id": 1, "rate": 0.052,
+         "charge": 520.0, "candidates": []}
+      ]
+    },
+    {
+      "from": "2026-07-01T00:00:00.000000+00:00", "to": "2027-01-01T00:00:00.000000+00:00",
+      "base_amount": 12000.0, "status": "ok", "line_total": 696.0,
+      "segments": [
+        {"from": "2026-07-01T00:00:00.000000+00:00", "to": "2027-01-01T00:00:00.000000+00:00",
+         "status": "covered", "portion": 1.0, "rate_id": 2, "rate": 0.058,
+         "charge": 696.0, "candidates": []}
+      ]
+    }
+  ]
+}
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -135,7 +209,7 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段）
+  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览）
   db.py        SQLite 连接与自动建表
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py

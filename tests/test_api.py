@@ -389,5 +389,255 @@ def test_coverage_open_ended_and_default_known_at(client):
     ]
 
 
+# ---------- 计费预览 ----------
+
+def post_preview(client, contract, **kw):
+    return client.post(f"/contracts/{contract}/charge-preview", json=kw)
+
+
+def test_charge_preview_single_version_full_cover(client):
+    post_rate(client, contract_no="P-1", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = post_preview(client, "P-1", known_at="2026-06-01T00:00:00Z", lines=[
+        {"from": "2026-02-01T00:00:00Z", "to": "2026-03-01T00:00:00Z", "base_amount": 1000.0},
+    ])
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["contract_no"] == "P-1"
+    assert data["known_at"] == "2026-06-01T00:00:00.000000+00:00"
+    assert data["status"] == "ok"
+    (line,) = data["lines"]
+    assert line["status"] == "ok"
+    assert line["from"] == "2026-02-01T00:00:00.000000+00:00"
+    assert line["to"] == "2026-03-01T00:00:00.000000+00:00"
+    assert line["base_amount"] == 1000.0
+    (seg,) = line["segments"]
+    assert seg["status"] == "covered"
+    assert seg["portion"] == 1.0
+    assert seg["rate_id"] == 1
+    assert seg["rate"] == 0.05
+    assert seg["charge"] == 50.0
+    assert seg["candidates"] == []
+    assert line["line_total"] == 50.0
+    assert data["total_amount"] == 50.0
+
+
+def test_charge_preview_splits_at_version_boundaries(client):
+    """账单行被两个相接版本的边界切开，各段按时长比例折算。"""
+    post_rate(client, contract_no="P-2", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-01-03T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="P-2", rate=0.08,
+              valid_from="2026-01-03T00:00:00Z", valid_to="2026-01-05T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    data = post_preview(client, "P-2", known_at="2026-02-01T00:00:00Z", lines=[
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-01-05T00:00:00Z", "base_amount": 1000.0},
+    ]).json()
+    (line,) = data["lines"]
+    segs = line["segments"]
+    assert [(s["status"], s["rate"], s["portion"]) for s in segs] == [
+        ("covered", 0.05, 0.5),
+        ("covered", 0.08, 0.5),
+    ]
+    assert [s["rate_id"] for s in segs] == [1, 2]
+    assert [s["charge"] for s in segs] == [25.0, 40.0]
+    assert line["line_total"] == 65.0
+    assert data["status"] == "ok"
+    assert data["total_amount"] == 65.0
+
+
+def test_charge_preview_prorates_by_duration(client):
+    """非对半的时长占比：1/3 与 2/3，费用按 6 位小数取舍。"""
+    post_rate(client, contract_no="P-3", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-01-02T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="P-3", rate=0.08,
+              valid_from="2026-01-02T00:00:00Z", valid_to="2026-01-04T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    data = post_preview(client, "P-3", known_at="2026-02-01T00:00:00Z", lines=[
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-01-04T00:00:00Z", "base_amount": 300.0},
+    ]).json()
+    (line,) = data["lines"]
+    segs = line["segments"]
+    assert [s["portion"] for s in segs] == [0.333333, 0.666667]
+    assert [s["charge"] for s in segs] == [5.0, 16.0]
+    assert line["line_total"] == 21.0
+    assert data["total_amount"] == 21.0
+
+
+def test_charge_preview_respects_known_at(client):
+    """同一账单行，修订前后的认知时点命中不同费率版本。"""
+    post_rate(client, contract_no="P-4", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="P-4", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-06-01T00:00:00Z")
+    line = {"from": "2026-01-01T00:00:00Z", "to": "2026-01-02T00:00:00Z", "base_amount": 100.0}
+    old = post_preview(client, "P-4", known_at="2026-03-01T00:00:00Z", lines=[line]).json()
+    assert old["lines"][0]["segments"][0]["rate"] == 0.05
+    assert old["lines"][0]["segments"][0]["rate_id"] == 1
+    new = post_preview(client, "P-4", known_at="2026-06-02T00:00:00Z", lines=[line]).json()
+    assert new["lines"][0]["segments"][0]["rate"] == 0.08
+    assert new["lines"][0]["segments"][0]["rate_id"] == 2
+
+
+def test_charge_preview_gap_rejects_total(client):
+    """部分区间无费率 → 该行标记 gap、行合计为 null，整体拒绝总额；正常行不受影响。"""
+    post_rate(client, contract_no="P-5", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-02-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    data = post_preview(client, "P-5", known_at="2026-03-01T00:00:00Z", lines=[
+        {"from": "2026-01-15T00:00:00Z", "to": "2026-03-01T00:00:00Z", "base_amount": 900.0},
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-01-02T00:00:00Z", "base_amount": 100.0},
+    ]).json()
+    assert data["status"] == "rejected"
+    assert data["total_amount"] is None
+    gap_line, ok_line = data["lines"]
+    assert gap_line["status"] == "gap"
+    assert gap_line["line_total"] is None
+    assert [s["status"] for s in gap_line["segments"]] == ["covered", "gap"]
+    gap_seg = gap_line["segments"][1]
+    assert gap_seg["from"] == "2026-02-01T00:00:00.000000+00:00"
+    assert gap_seg["rate_id"] is None
+    assert gap_seg["rate"] is None
+    assert gap_seg["charge"] is None
+    assert gap_seg["candidates"] == []
+    # 未受影响的行仍正常计价
+    assert ok_line["status"] == "ok"
+    assert ok_line["line_total"] == 5.0
+
+
+def test_charge_preview_conflict_rejects_total(client):
+    """注入重叠脏数据 → 重叠区段标记 conflict 并附候选，行与总额均被拒绝。"""
+    post_rate(client, contract_no="P-6", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version) "
+            "VALUES ('P-6', 0.99, '2026-01-02T00:00:00.000000+00:00', "
+            "        '2026-01-04T00:00:00.000000+00:00', "
+            "        '2026-01-01T00:00:00.000000+00:00', 2)"
+        )
+    data = post_preview(client, "P-6", known_at="2026-02-01T00:00:00Z", lines=[
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-01-05T00:00:00Z", "base_amount": 400.0},
+    ]).json()
+    (line,) = data["lines"]
+    assert line["status"] == "conflict"
+    assert line["line_total"] is None
+    assert data["status"] == "rejected"
+    assert data["total_amount"] is None
+    assert [s["status"] for s in line["segments"]] == ["covered", "conflict", "covered"]
+    conflict = line["segments"][1]
+    assert conflict["from"] == "2026-01-02T00:00:00.000000+00:00"
+    assert conflict["to"] == "2026-01-04T00:00:00.000000+00:00"
+    assert conflict["portion"] == 0.5
+    assert conflict["charge"] is None
+    assert [(c["rate_id"], c["rate"], c["version"]) for c in conflict["candidates"]] == [
+        (1, 0.05, 1), (2, 0.99, 2),
+    ]
+
+
+def test_charge_preview_mixed_gap_and_conflict(client):
+    """同一行同时出现 gap 与 conflict 段 → 行状态 mixed。"""
+    post_rate(client, contract_no="P-7", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-01-03T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version) "
+            "VALUES ('P-7', 0.99, '2026-01-02T00:00:00.000000+00:00', "
+            "        '2026-01-03T00:00:00.000000+00:00', "
+            "        '2026-01-01T00:00:00.000000+00:00', 2)"
+        )
+    data = post_preview(client, "P-7", known_at="2026-02-01T00:00:00Z", lines=[
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-01-05T00:00:00Z", "base_amount": 400.0},
+    ]).json()
+    (line,) = data["lines"]
+    assert [s["status"] for s in line["segments"]] == ["covered", "conflict", "gap"]
+    assert line["status"] == "mixed"
+    assert line["line_total"] is None
+    assert data["status"] == "rejected"
+    assert data["total_amount"] is None
+
+
+def test_charge_preview_unknown_contract_is_all_gap(client):
+    """合同不存在（或该认知时点无可见版本）→ 整行 gap，拒绝总额，不报 404。"""
+    r = post_preview(client, "GHOST", known_at="2026-06-01T00:00:00Z", lines=[
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-02-01T00:00:00Z", "base_amount": 100.0},
+    ])
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "rejected"
+    assert data["total_amount"] is None
+    (line,) = data["lines"]
+    assert line["status"] == "gap"
+    assert [s["status"] for s in line["segments"]] == ["gap"]
+
+
+def test_charge_preview_multiple_lines_sum(client):
+    post_rate(client, contract_no="P-8", rate=0.5,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    data = post_preview(client, "P-8", known_at="2026-06-01T00:00:00Z", lines=[
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-01-02T00:00:00Z", "base_amount": 100.0},
+        {"from": "2026-02-01T00:00:00Z", "to": "2026-02-03T00:00:00Z", "base_amount": 200.0},
+    ]).json()
+    assert data["status"] == "ok"
+    assert [line["line_total"] for line in data["lines"]] == [50.0, 100.0]
+    assert data["total_amount"] == 150.0
+
+
+def test_charge_preview_default_known_at_is_now(client):
+    # recorded_at 缺省 = 当前时间；不指定 known_at 的预览应立即可见
+    post_rate(client, contract_no="P-9", rate=0.1, valid_from="2020-01-01T00:00:00Z")
+    data = post_preview(client, "P-9", lines=[
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-01-02T00:00:00Z", "base_amount": 10.0},
+    ]).json()
+    assert data["status"] == "ok"
+    assert data["total_amount"] == 1.0
+
+
+def test_charge_preview_invalid_interval(client):
+    for frm, to in [("2026-02-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+                    ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")]:
+        r = post_preview(client, "P-10", lines=[{"from": frm, "to": to, "base_amount": 100.0}])
+        assert r.status_code == 422
+        assert r.json()["detail"]["code"] == "INVALID_INTERVAL"
+
+
+def test_charge_preview_invalid_amount(client):
+    r = post_preview(client, "P-11", lines=[
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-02-01T00:00:00Z", "base_amount": -1.0},
+    ])
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_AMOUNT"
+
+
+def test_charge_preview_future_known_at_rejected(client):
+    r = post_preview(client, "P-12", known_at="2999-01-01T00:00:00Z", lines=[
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-02-01T00:00:00Z", "base_amount": 100.0},
+    ])
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_KNOWN_AT"
+
+
+def test_charge_preview_malformed_request_422(client):
+    # 空账单行列表 / 缺少必填字段 → 统一的 INVALID_REQUEST
+    r = post_preview(client, "P-13", lines=[])
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+    r = post_preview(client, "P-13", lines=[{"from": "2026-01-01T00:00:00Z",
+                                             "to": "2026-02-01T00:00:00Z"}])
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+
+
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
